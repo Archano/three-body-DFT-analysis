@@ -1,5 +1,6 @@
 import csv
 import math
+import os
 import sys
 from datetime import datetime
 
@@ -7,6 +8,7 @@ try:
     from PyQt6.QtCore import Qt, QTimer
     from PyQt6.QtWidgets import (
         QApplication,
+        QFileDialog,
         QFormLayout,
         QFrame,
         QGridLayout,
@@ -15,13 +17,16 @@ try:
         QLabel,
         QLineEdit,
         QMainWindow,
+        QMessageBox,
         QProgressBar,
         QPushButton,
         QScrollArea,
         QSizePolicy,
+        QTabWidget,
         QVBoxLayout,
         QWidget,
     )
+    from matplotlib.backends.backend_qt import NavigationToolbar2QT as NavigationToolbar
     from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
     from matplotlib.figure import Figure
 except ModuleNotFoundError as exc:
@@ -37,6 +42,7 @@ from physicsEngine import (
     simSetup,
     simulationStep,
 )
+from DFTplotter import load_position_csv, position_spectrum
 
 
 SYSTEM_PRESETS = {
@@ -79,6 +85,47 @@ def lagrange_points(mu):
     return l4, l5
 
 
+class DFTPlotWindow(QMainWindow):
+    def __init__(self, title, series):
+        super().__init__()
+        self.setWindowTitle(title)
+        self.resize(950, 650)
+
+        central_widget = QWidget()
+        layout = QVBoxLayout(central_widget)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(8)
+
+        self.figure = Figure(figsize=(8, 5), tight_layout=True, facecolor="#f7f8fa")
+        self.canvas = FigureCanvas(self.figure)
+        self.toolbar = NavigationToolbar(self.canvas, self)
+
+        layout.addWidget(self.toolbar)
+        layout.addWidget(self.canvas)
+        self.setCentralWidget(central_widget)
+
+        self.ax = self.figure.add_subplot(111)
+        self.ax.set_title(title)
+        self.ax.set_xlabel("Frequency [cycles / simulation time unit]")
+        self.ax.set_ylabel("DFT magnitude")
+        self.ax.set_facecolor("#fbfbfd")
+        self.ax.grid(True, color="#d9dde5", linewidth=0.8)
+
+        for label, frequencies, magnitudes, color in series:
+            self.ax.plot(
+                frequencies[1:],
+                magnitudes[1:],
+                linewidth=1.1,
+                label=label,
+                color=color,
+            )
+
+        self.ax.set_xlim(0.0, 0.5)
+
+        self.ax.legend(loc="upper right", frameon=True, framealpha=0.92)
+        self.canvas.draw_idle()
+
+
 class CR3BPGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -107,6 +154,7 @@ class CR3BPGUI(QMainWindow):
         self.remaining_batch_steps = 0
         self.run_records = []
         self.last_export_filename = None
+        self.analysis_windows = []
 
         self.x_history = [self.state[0]]
         self.y_history = [self.state[1]]
@@ -124,8 +172,9 @@ class CR3BPGUI(QMainWindow):
         self.timer.start()
 
     def setup_ui(self):
-        central_widget = QWidget()
-        root_layout = QHBoxLayout(central_widget)
+        tabs = QTabWidget()
+        simulation_tab = QWidget()
+        root_layout = QHBoxLayout(simulation_tab)
         root_layout.setContentsMargins(10, 10, 10, 10)
         root_layout.setSpacing(10)
 
@@ -135,14 +184,33 @@ class CR3BPGUI(QMainWindow):
         plot_panel = QWidget()
         plot_layout = QVBoxLayout(plot_panel)
         plot_layout.setContentsMargins(0, 0, 0, 0)
+        plot_layout.setSpacing(8)
 
-        self.figure = Figure(figsize=(8, 6), tight_layout=True)
+        self.figure = Figure(figsize=(8, 6), tight_layout=True, facecolor="#f7f8fa")
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+
+        self.toolbar = NavigationToolbar(self.canvas, self)
+        plot_layout.addWidget(self.toolbar)
+
+        self.status_label = QLabel()
+        self.status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.status_label.setWordWrap(True)
+        self.status_label.setFrameShape(QFrame.Shape.StyledPanel)
+        self.status_label.setStyleSheet(
+            "font-family: Consolas, monospace; font-size: 12px; "
+            "background: #ffffff; color: #20242a; padding: 8px;"
+        )
+        plot_layout.addWidget(self.status_label)
         plot_layout.addWidget(self.canvas)
 
         root_layout.addWidget(plot_panel, 1)
-        self.setCentralWidget(central_widget)
+
+        tabs.addTab(simulation_tab, "Simulation")
+        tabs.addTab(self.build_processing_tab(), "Processing")
+        self.setCentralWidget(tabs)
 
     def build_controls(self):
         scroll = QScrollArea()
@@ -225,6 +293,7 @@ class CR3BPGUI(QMainWindow):
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setTextVisible(True)
+        self.progress_bar.setFormat("%p%")
 
         batch_group = QGroupBox("Batch CSV")
         batch_layout = QFormLayout(batch_group)
@@ -251,62 +320,296 @@ class CR3BPGUI(QMainWindow):
         hint.setStyleSheet("color: #444; padding: 8px;")
         layout.addWidget(hint)
 
-        self.status_label = QLabel()
-        self.status_label.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        self.status_label.setStyleSheet(
-            "font-family: Consolas, monospace; font-size: 12px; padding: 8px;"
-        )
-        self.status_label.setFrameShape(QFrame.Shape.StyledPanel)
-        layout.addWidget(self.status_label)
-
         layout.addStretch(1)
         scroll.setWidget(panel)
         return scroll
 
+    def build_processing_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        file_group = QGroupBox("Load Simulation CSV")
+        file_layout = QVBoxLayout(file_group)
+
+        path_row = QHBoxLayout()
+        self.analysis_file_box = QLineEdit()
+        self.analysis_file_box.setPlaceholderText("Select a generated cr3bp_*.csv file")
+        browse_button = QPushButton("Browse CSV")
+        browse_button.clicked.connect(self.browse_analysis_csv)
+        last_export_button = QPushButton("Use last export")
+        last_export_button.clicked.connect(self.use_last_export_for_analysis)
+        path_row.addWidget(self.analysis_file_box, 1)
+        path_row.addWidget(browse_button)
+        path_row.addWidget(last_export_button)
+        file_layout.addLayout(path_row)
+
+        compute_row = QHBoxLayout()
+        x_dft_button = QPushButton("Plot x-position DFT")
+        x_dft_button.clicked.connect(lambda: self.plot_position_dft("x"))
+        y_dft_button = QPushButton("Plot y-position DFT")
+        y_dft_button.clicked.connect(lambda: self.plot_position_dft("y"))
+        both_dft_button = QPushButton("Plot x + y DFT")
+        both_dft_button.clicked.connect(lambda: self.plot_position_dft("both"))
+        compute_row.addWidget(x_dft_button)
+        compute_row.addWidget(y_dft_button)
+        compute_row.addWidget(both_dft_button)
+        file_layout.addLayout(compute_row)
+        layout.addWidget(file_group)
+
+        hint = QLabel(
+            "This tab loads a CSV generated from the Simulation tab and computes "
+            "one-sided DFT magnitudes for the particle position columns."
+        )
+        hint.setWordWrap(True)
+        hint.setFrameShape(QFrame.Shape.StyledPanel)
+        hint.setStyleSheet("color: #444; padding: 10px;")
+        layout.addWidget(hint)
+
+        self.analysis_status_label = QLabel("No CSV loaded.")
+        self.analysis_status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.analysis_status_label.setFrameShape(QFrame.Shape.StyledPanel)
+        self.analysis_status_label.setStyleSheet(
+            "font-family: Consolas, monospace; font-size: 12px; "
+            "background: #ffffff; color: #20242a; padding: 10px;"
+        )
+        layout.addWidget(self.analysis_status_label)
+        layout.addStretch(1)
+        return tab
+
     def setup_plot(self):
         self.ax = self.figure.add_subplot(111)
-        self.ax.set_title("Circular Restricted Three-Body Problem")
+        self.ax.set_title("Circular Restricted Three-Body Problem", pad=12)
         self.ax.set_xlabel("x")
         self.ax.set_ylabel("y")
-        self.ax.grid(True, alpha=0.35)
+        self.ax.set_facecolor("#fbfbfd")
+        self.ax.grid(True, color="#d9dde5", linewidth=0.8)
         self.ax.set_aspect("equal", adjustable="box")
         self.ax.set_xlim(-0.5, 1.5)
         self.ax.set_ylim(-1.2, 1.2)
+        self.ax.axhline(0.0, color="#b7bdc7", linewidth=0.8, zorder=0)
+        self.ax.axvline(0.0, color="#b7bdc7", linewidth=0.8, zorder=0)
 
         self.body1_marker = self.ax.scatter(
-            [self.body1_x], [0.0], s=160, label="Body 1"
+            [self.body1_x],
+            [0.0],
+            s=190,
+            color="#1f77b4",
+            edgecolors="#0b3356",
+            linewidths=1.2,
+            label="Body 1",
+            zorder=4,
         )
         self.body2_marker = self.ax.scatter(
-            [self.body2_x], [0.0], s=80, label="Body 2"
+            [self.body2_x],
+            [0.0],
+            s=110,
+            color="#ff9f1c",
+            edgecolors="#8f5200",
+            linewidths=1.0,
+            label="Body 2",
+            zorder=4,
+        )
+        self.body1_label = self.ax.text(
+            self.body1_x,
+            -0.08,
+            "Body 1",
+            ha="center",
+            va="top",
+            fontsize=9,
+            color="#0b3356",
+        )
+        self.body2_label = self.ax.text(
+            self.body2_x,
+            -0.08,
+            "Body 2",
+            ha="center",
+            va="top",
+            fontsize=9,
+            color="#8f5200",
         )
         self.l4_marker = self.ax.scatter(
-            [self.l4[0]], [self.l4[1]], marker="x", s=90, label="L4"
+            [self.l4[0]],
+            [self.l4[1]],
+            marker="x",
+            s=120,
+            color="#2a9d8f",
+            linewidths=2.0,
+            label="L4",
+            zorder=3,
         )
         self.l5_marker = self.ax.scatter(
-            [self.l5[0]], [self.l5[1]], marker="x", s=90, label="L5"
+            [self.l5[0]],
+            [self.l5[1]],
+            marker="x",
+            s=120,
+            color="#e76f51",
+            linewidths=2.0,
+            label="L5",
+            zorder=3,
         )
         self.trajectory_line, = self.ax.plot(
             self.x_history,
             self.y_history,
-            linewidth=1.0,
+            color="#5b5f97",
+            linewidth=1.35,
+            alpha=0.9,
             label="Trajectory",
+            zorder=2,
         )
         self.particle_dot, = self.ax.plot(
             [self.state[0]],
             [self.state[1]],
             marker="o",
-            markersize=6,
+            markersize=7,
             linestyle="None",
+            color="#d62828",
+            markeredgecolor="#7f0000",
             label="Particle",
+            zorder=5,
         )
-        self.ax.legend(loc="upper right")
+        self.ax.legend(loc="upper right", frameon=True, framealpha=0.92)
 
     def add_line_edit(self, initial_text):
         line_edit = QLineEdit(initial_text)
         line_edit.setMinimumWidth(145)
         return line_edit
+
+    def browse_analysis_csv(self):
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select simulation CSV",
+            os.getcwd(),
+            "CSV files (*.csv);;All files (*)",
+        )
+
+        if file_path:
+            self.analysis_file_box.setText(file_path)
+            self.analysis_status_label.setText(f"Loaded path:\n{file_path}")
+
+    def use_last_export_for_analysis(self):
+        if not self.last_export_filename:
+            QMessageBox.warning(
+                self,
+                "No export yet",
+                "No CSV has been exported in this session yet.",
+            )
+            return
+
+        file_path = os.path.abspath(self.last_export_filename)
+        self.analysis_file_box.setText(file_path)
+        self.analysis_status_label.setText(f"Loaded last export:\n{file_path}")
+
+    def plot_position_dft(self, component):
+        file_path = self.analysis_file_box.text().strip()
+
+        if not file_path:
+            QMessageBox.warning(
+                self,
+                "No CSV selected",
+                "Choose a generated simulation CSV first.",
+            )
+            return
+
+        if not os.path.exists(file_path):
+            QMessageBox.warning(
+                self,
+                "CSV not found",
+                f"Could not find:\n{file_path}",
+            )
+            return
+
+        try:
+            x_values, y_values, csv_timestep = load_position_csv(file_path)
+            if not x_values or not y_values:
+                raise ValueError("CSV contains no x/y position rows.")
+
+            if component == "x":
+                x_spectrum = position_spectrum(x_values, csv_timestep)
+                series = [
+                    (
+                        "x position",
+                        x_spectrum["frequencies"],
+                        x_spectrum["magnitudes"],
+                        "#1f77b4",
+                    ),
+                ]
+                title = "X Position DFT Magnitudes"
+                dominant_lines = [self.format_dominant_frequency("x", x_spectrum)]
+            elif component == "y":
+                y_spectrum = position_spectrum(y_values, csv_timestep)
+                series = [
+                    (
+                        "y position",
+                        y_spectrum["frequencies"],
+                        y_spectrum["magnitudes"],
+                        "#ff9f1c",
+                    ),
+                ]
+                title = "Y Position DFT Magnitudes"
+                dominant_lines = [self.format_dominant_frequency("y", y_spectrum)]
+            else:
+                x_spectrum = position_spectrum(x_values, csv_timestep)
+                y_spectrum = position_spectrum(y_values, csv_timestep)
+                series = [
+                    (
+                        "x position",
+                        x_spectrum["frequencies"],
+                        x_spectrum["magnitudes"],
+                        "#1f77b4",
+                    ),
+                    (
+                        "y position",
+                        y_spectrum["frequencies"],
+                        y_spectrum["magnitudes"],
+                        "#ff9f1c",
+                    ),
+                ]
+                title = "Position DFT Magnitudes"
+                dominant_lines = [
+                    self.format_dominant_frequency("x", x_spectrum),
+                    self.format_dominant_frequency("y", y_spectrum),
+                ]
+        except (KeyError, ValueError, OSError) as exc:
+            QMessageBox.critical(
+                self,
+                "DFT failed",
+                f"Could not compute DFT magnitudes from this CSV:\n{exc}",
+            )
+            return
+
+        window = DFTPlotWindow(title, series)
+        self.analysis_windows.append(window)
+        window.show()
+
+        self.analysis_status_label.setText(
+            f"CSV: {file_path}\n"
+            f"timestep: {csv_timestep}\n"
+            f"samples: x={len(x_values)}, y={len(y_values)}\n"
+            f"latest plot: {title}\n"
+            + "\n".join(dominant_lines)
+        )
+
+    def format_dominant_frequency(self, label, spectrum):
+        dominant_frequency = spectrum["dominant_frequency"]
+        dominant_magnitude = spectrum["dominant_magnitude"]
+
+        if dominant_frequency is None:
+            return f"{label} dominant nonzero frequency: N/A"
+
+        print(
+            f"{label} dominant nonzero frequency: "
+            f"{dominant_frequency:.8g} cycles / simulation time unit"
+        )
+
+        return (
+            f"{label} dominant nonzero frequency: "
+            f"{dominant_frequency:.8g} cycles / simulation time unit "
+            f"(magnitude {dominant_magnitude:.8g})"
+        )
 
     def parse_float(self, line_edit, fallback):
         try:
@@ -354,6 +657,8 @@ class CR3BPGUI(QMainWindow):
         self.body2_marker.set_offsets([[self.body2_x, 0.0]])
         self.l4_marker.set_offsets([[self.l4[0], self.l4[1]]])
         self.l5_marker.set_offsets([[self.l5[0], self.l5[1]]])
+        self.body1_label.set_position((self.body1_x, -0.08))
+        self.body2_label.set_position((self.body2_x, -0.08))
 
     def apply_reset(self):
         self.running = False
@@ -535,28 +840,28 @@ class CR3BPGUI(QMainWindow):
 
         real_days = self.sim_time_to_real_days(self.time)
         one_unit_days = self.one_time_unit_in_days()
-        real_time_line = "real time: N/A"
-        unit_line = "1 sim unit: N/A"
+        real_time = "N/A"
+        unit_time = "N/A"
 
         if real_days is not None:
-            real_time_line = f"real time: {real_days:.4f} days"
-            unit_line = f"1 sim unit: {one_unit_days:.4f} days"
+            real_time = f"{real_days:.4f} days"
+            unit_time = f"{one_unit_days:.4f} days"
 
         completed_steps = self.batch_total_steps - self.remaining_batch_steps
         export_line = self.last_export_filename or "none"
         self.status_label.setText(
-            f"system: {self.current_system_name}\n"
-            f"running: {self.running}\n"
-            f"t_sim: {self.time:.4f}\n"
-            f"{real_time_line}\n"
-            f"{unit_line}\n"
-            f"mu: {self.mu:.8f}\n"
-            f"x: {self.state[0]:.5f}\n"
-            f"y: {self.state[1]:.5f}\n"
-            f"vx: {self.state[2]:.5f}\n"
-            f"vy: {self.state[3]:.5f}\n"
-            f"trail drawn: {len(x_visible)}/{len(self.x_history)}\n"
-            f"csv steps: {completed_steps}/{self.batch_total_steps}\n"
+            f"System: {self.current_system_name}   "
+            f"Running: {self.running}   "
+            f"mu: {self.mu:.8f}   "
+            f"t_sim: {self.time:.4f}   "
+            f"real time: {real_time}   "
+            f"1 sim unit: {unit_time}\n"
+            f"x: {self.state[0]:.5f}   "
+            f"y: {self.state[1]:.5f}   "
+            f"vx: {self.state[2]:.5f}   "
+            f"vy: {self.state[3]:.5f}   "
+            f"trail: {len(x_visible)}/{len(self.x_history)}   "
+            f"csv: {completed_steps}/{self.batch_total_steps}   "
             f"last export: {export_line}"
         )
 
