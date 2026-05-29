@@ -973,9 +973,14 @@ class CR3BPGUI(QMainWindow):
         if not self.run_records:
             return
 
+        export_folder = "simulations"
+        os.makedirs(export_folder, exist_ok=True)
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_system_name = self.current_system_name.replace(" ", "_").replace("-", "_")
         filename = f"cr3bp_{safe_system_name}_{timestamp}.csv"
+
+        filepath = os.path.join(export_folder, filename)
 
         fieldnames = [
             "step_index",
@@ -994,12 +999,12 @@ class CR3BPGUI(QMainWindow):
             "r2",
         ]
 
-        with open(filename, "w", newline="") as file:
+        with open(filepath, "w", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(self.run_records)
 
-        self.last_export_filename = filename
+        self.last_export_filename = filepath
 
 
 def main():
