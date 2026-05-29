@@ -80,9 +80,31 @@ SYSTEM_PRESETS = {
 
 
 def lagrange_points(mu):
+    # Finding roots of a 5-nomial using bisection
+    def find_root(f, a, b, tol=1e-12):
+        for _ in range(100):
+            c = (a + b) / 2.0
+            if abs(f(c)) < tol or (b - a) / 2.0 < tol:
+                return c
+            if f(c) * f(a) > 0:
+                a = c
+            else:
+                b = c
+        return (a + b) / 2.0
+
+    def f_collinear(x):
+        term1 = (1 - mu) * (x + mu) / abs(x + mu) ** 3
+        term2 = mu * (x - 1 + mu) / abs(x - 1 + mu) ** 3
+        return x - term1 - term2
+
+    l1_x = find_root(f_collinear, -mu + 1e-5, 1 - mu - 1e-5)
+    l2_x = find_root(f_collinear, 1 - mu + 1e-5, 2.0)
+    l3_x = find_root(f_collinear, -2.0, -mu - 1e-5)
+
     l4 = (0.5 - mu, math.sqrt(3) / 2)
     l5 = (0.5 - mu, -math.sqrt(3) / 2)
-    return l4, l5
+
+    return (l1_x, 0.0), (l2_x, 0.0), (l3_x, 0.0), l4, l5
 
 
 class DFTPlotWindow(QMainWindow):
@@ -140,7 +162,7 @@ class CR3BPGUI(QMainWindow):
             self.body1_mass,
             self.body2_mass,
         )
-        self.l4, self.l5 = lagrange_points(self.mu)
+        self.l1, self.l2, self.l3, self.l4, self.l5 = lagrange_points(self.mu)
 
         self.state = [self.l4[0] + 0.01, self.l4[1], 0.0, 0.0]
         self.timestep = 0.001
@@ -275,14 +297,32 @@ class CR3BPGUI(QMainWindow):
         sim_buttons.addWidget(self.reset_button)
         sim_layout.addRow(sim_buttons)
 
-        point_buttons = QHBoxLayout()
+        unstable_group = QGroupBox("Unstable Points")
+        unstable_layout = QHBoxLayout(unstable_group)
+
+        l1_button = QPushButton("Near L1")
+        l1_button.clicked.connect(self.set_near_l1)
+        l2_button = QPushButton("Near L2")
+        l2_button.clicked.connect(self.set_near_l2)
+        l3_button = QPushButton("Near L3")
+        l3_button.clicked.connect(self.set_near_l3)
+
+        unstable_layout.addWidget(l1_button)
+        unstable_layout.addWidget(l2_button)
+        unstable_layout.addWidget(l3_button)
+        sim_layout.addRow(unstable_group)
+
+        stable_group = QGroupBox("Stable Points")
+        stable_layout = QHBoxLayout(stable_group)
+
         l4_button = QPushButton("Near L4")
         l4_button.clicked.connect(self.set_near_l4)
         l5_button = QPushButton("Near L5")
         l5_button.clicked.connect(self.set_near_l5)
-        point_buttons.addWidget(l4_button)
-        point_buttons.addWidget(l5_button)
-        sim_layout.addRow(point_buttons)
+
+        stable_layout.addWidget(l4_button)
+        stable_layout.addWidget(l5_button)
+        sim_layout.addRow(stable_group)
 
         clear_button = QPushButton("Clear trail")
         clear_button.clicked.connect(self.clear_trail)
@@ -388,7 +428,7 @@ class CR3BPGUI(QMainWindow):
         self.ax.set_facecolor("#fbfbfd")
         self.ax.grid(True, color="#d9dde5", linewidth=0.8)
         self.ax.set_aspect("equal", adjustable="box")
-        self.ax.set_xlim(-0.5, 1.5)
+        self.ax.set_xlim(-1.5, 1.5)
         self.ax.set_ylim(-1.2, 1.2)
         self.ax.axhline(0.0, color="#b7bdc7", linewidth=0.8, zorder=0)
         self.ax.axvline(0.0, color="#b7bdc7", linewidth=0.8, zorder=0)
@@ -431,6 +471,22 @@ class CR3BPGUI(QMainWindow):
             fontsize=9,
             color="#8f5200",
         )
+
+        self.l1_marker = self.ax.scatter(
+            [self.l1[0]], [self.l1[1]], marker="+", s=100, color="#9b5de5",
+            linewidths=1.5, label="L1", zorder=3,
+        )
+
+        self.l2_marker = self.ax.scatter(
+            [self.l2[0]], [self.l2[1]], marker="+", s=100, color="#f15bb5",
+            linewidths=1.5, label="L2", zorder=3,
+        )
+
+        self.l3_marker = self.ax.scatter(
+            [self.l3[0]], [self.l3[1]], marker="+", s=100, color="#00bbf9",
+            linewidths=1.5, label="L3", zorder=3,
+        )
+
         self.l4_marker = self.ax.scatter(
             [self.l4[0]],
             [self.l4[1]],
@@ -651,12 +707,16 @@ class CR3BPGUI(QMainWindow):
             self.body1_mass,
             self.body2_mass,
         )
-        self.l4, self.l5 = lagrange_points(self.mu)
+        self.l1, self.l2, self.l3, self.l4, self.l5 = lagrange_points(self.mu)
 
         self.body1_marker.set_offsets([[self.body1_x, 0.0]])
         self.body2_marker.set_offsets([[self.body2_x, 0.0]])
+        self.l1_marker.set_offsets([[self.l1[0], self.l1[1]]])
+        self.l2_marker.set_offsets([[self.l2[0], self.l2[1]]])
+        self.l3_marker.set_offsets([[self.l3[0], self.l3[1]]])
         self.l4_marker.set_offsets([[self.l4[0], self.l4[1]]])
         self.l5_marker.set_offsets([[self.l5[0], self.l5[1]]])
+
         self.body1_label.set_position((self.body1_x, -0.08))
         self.body2_label.set_position((self.body2_x, -0.08))
 
@@ -676,6 +736,24 @@ class CR3BPGUI(QMainWindow):
         vx0 = self.parse_float(self.vx_box, self.state[2])
         vy0 = self.parse_float(self.vy_box, self.state[3])
         self.reset_state(x0, y0, vx0, vy0)
+
+    def set_near_l1(self):
+        self.update_masses_from_inputs()
+        x0, y0 = self.l1[0] + 0.01, self.l1[1]
+        self.set_initial_condition_boxes(x0, y0, 0.0, 0.0)
+        self.reset_state(x0, y0, 0.0, 0.0)
+
+    def set_near_l2(self):
+        self.update_masses_from_inputs()
+        x0, y0 = self.l2[0] + 0.01, self.l2[1]
+        self.set_initial_condition_boxes(x0, y0, 0.0, 0.0)
+        self.reset_state(x0, y0, 0.0, 0.0)
+
+    def set_near_l3(self):
+        self.update_masses_from_inputs()
+        x0, y0 = self.l3[0] + 0.01, self.l3[1]
+        self.set_initial_condition_boxes(x0, y0, 0.0, 0.0)
+        self.reset_state(x0, y0, 0.0, 0.0)
 
     def set_near_l4(self):
         self.update_masses_from_inputs()
