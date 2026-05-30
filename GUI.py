@@ -42,7 +42,16 @@ from physicsEngine import (
     simSetup,
     simulationStep,
 )
-from DFTplotter import load_position_csv, position_spectrum
+from DFTplotter import (
+    load_csv_metadata,
+    load_position_csv,
+    point_distance_spectrum,
+    position_spectrum,
+    spectrum_characteristics,
+)
+
+
+CSV_OUTPUT_DIR = "csv_outputs"
 
 
 SYSTEM_PRESETS = {
@@ -107,47 +116,6 @@ def lagrange_points(mu):
     return (l1_x, 0.0), (l2_x, 0.0), (l3_x, 0.0), l4, l5
 
 
-class DFTPlotWindow(QMainWindow):
-    def __init__(self, title, series):
-        super().__init__()
-        self.setWindowTitle(title)
-        self.resize(950, 650)
-
-        central_widget = QWidget()
-        layout = QVBoxLayout(central_widget)
-        layout.setContentsMargins(8, 8, 8, 8)
-        layout.setSpacing(8)
-
-        self.figure = Figure(figsize=(8, 5), tight_layout=True, facecolor="#f7f8fa")
-        self.canvas = FigureCanvas(self.figure)
-        self.toolbar = NavigationToolbar(self.canvas, self)
-
-        layout.addWidget(self.toolbar)
-        layout.addWidget(self.canvas)
-        self.setCentralWidget(central_widget)
-
-        self.ax = self.figure.add_subplot(111)
-        self.ax.set_title(title)
-        self.ax.set_xlabel("Frequency [cycles / simulation time unit]")
-        self.ax.set_ylabel("DFT magnitude")
-        self.ax.set_facecolor("#fbfbfd")
-        self.ax.grid(True, color="#d9dde5", linewidth=0.8)
-
-        for label, frequencies, magnitudes, color in series:
-            self.ax.plot(
-                frequencies[1:],
-                magnitudes[1:],
-                linewidth=1.1,
-                label=label,
-                color=color,
-            )
-
-        self.ax.set_xlim(0.0, 0.5)
-
-        self.ax.legend(loc="upper right", frameon=True, framealpha=0.92)
-        self.canvas.draw_idle()
-
-
 class CR3BPGUI(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -176,7 +144,6 @@ class CR3BPGUI(QMainWindow):
         self.remaining_batch_steps = 0
         self.run_records = []
         self.last_export_filename = None
-        self.analysis_windows = []
 
         self.x_history = [self.state[0]]
         self.y_history = [self.state[1]]
@@ -212,8 +179,16 @@ class CR3BPGUI(QMainWindow):
         self.canvas = FigureCanvas(self.figure)
         self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
+        plot_tool_row = QHBoxLayout()
         self.toolbar = NavigationToolbar(self.canvas, self)
-        plot_layout.addWidget(self.toolbar)
+        plot_zoom_in_button = QPushButton("Zoom in")
+        plot_zoom_in_button.clicked.connect(self.zoom_in_simulation_plot)
+        plot_zoom_out_button = QPushButton("Zoom out")
+        plot_zoom_out_button.clicked.connect(self.zoom_out_simulation_plot)
+        plot_tool_row.addWidget(self.toolbar, 1)
+        plot_tool_row.addWidget(plot_zoom_in_button)
+        plot_tool_row.addWidget(plot_zoom_out_button)
+        plot_layout.addLayout(plot_tool_row)
 
         self.status_label = QLabel()
         self.status_label.setTextInteractionFlags(
@@ -324,9 +299,17 @@ class CR3BPGUI(QMainWindow):
         stable_layout.addWidget(l5_button)
         sim_layout.addRow(stable_group)
 
+        view_buttons = QHBoxLayout()
         clear_button = QPushButton("Clear trail")
         clear_button.clicked.connect(self.clear_trail)
-        sim_layout.addRow(clear_button)
+        zoom_in_button = QPushButton("Zoom in")
+        zoom_in_button.clicked.connect(self.zoom_in_simulation_plot)
+        zoom_out_button = QPushButton("Zoom out")
+        zoom_out_button.clicked.connect(self.zoom_out_simulation_plot)
+        view_buttons.addWidget(clear_button)
+        view_buttons.addWidget(zoom_in_button)
+        view_buttons.addWidget(zoom_out_button)
+        sim_layout.addRow(view_buttons)
         layout.addWidget(sim_group)
 
         self.batch_steps_box = self.add_line_edit("50000")
@@ -396,6 +379,21 @@ class CR3BPGUI(QMainWindow):
         compute_row.addWidget(y_dft_button)
         compute_row.addWidget(both_dft_button)
         file_layout.addLayout(compute_row)
+
+        point_row = QHBoxLayout()
+        body1_dft_button = QPushButton("Plot Body 1 distance DFT")
+        body1_dft_button.clicked.connect(lambda: self.plot_point_distance_dft("body1"))
+        body2_dft_button = QPushButton("Plot Body 2 distance DFT")
+        body2_dft_button.clicked.connect(lambda: self.plot_point_distance_dft("body2"))
+        l4_dft_button = QPushButton("Plot L4 distance DFT")
+        l4_dft_button.clicked.connect(lambda: self.plot_point_distance_dft("l4"))
+        l5_dft_button = QPushButton("Plot L5 distance DFT")
+        l5_dft_button.clicked.connect(lambda: self.plot_point_distance_dft("l5"))
+        point_row.addWidget(body1_dft_button)
+        point_row.addWidget(body2_dft_button)
+        point_row.addWidget(l4_dft_button)
+        point_row.addWidget(l5_dft_button)
+        file_layout.addLayout(point_row)
         layout.addWidget(file_group)
 
         hint = QLabel(
@@ -407,18 +405,174 @@ class CR3BPGUI(QMainWindow):
         hint.setStyleSheet("color: #444; padding: 10px;")
         layout.addWidget(hint)
 
-        self.analysis_status_label = QLabel("No CSV loaded.")
-        self.analysis_status_label.setTextInteractionFlags(
+        result_panel = QWidget()
+        result_layout = QHBoxLayout(result_panel)
+        result_layout.setContentsMargins(0, 0, 0, 0)
+        result_layout.setSpacing(12)
+
+        plot_panel = QWidget()
+        plot_layout = QVBoxLayout(plot_panel)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+        plot_layout.setSpacing(8)
+
+        self.analysis_figure = Figure(figsize=(8, 5), tight_layout=True, facecolor="#f7f8fa")
+        self.analysis_canvas = FigureCanvas(self.analysis_figure)
+        self.analysis_canvas.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.analysis_toolbar = NavigationToolbar(self.analysis_canvas, self)
+        plot_layout.addWidget(self.analysis_toolbar)
+        plot_layout.addWidget(self.analysis_canvas)
+
+        self.analysis_report_label = QLabel("No analysis run yet.")
+        self.analysis_report_label.setWordWrap(True)
+        self.analysis_report_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        self.analysis_status_label.setFrameShape(QFrame.Shape.StyledPanel)
-        self.analysis_status_label.setStyleSheet(
+        self.analysis_report_label.setFrameShape(QFrame.Shape.StyledPanel)
+        self.analysis_report_label.setStyleSheet(
             "font-family: Consolas, monospace; font-size: 12px; "
             "background: #ffffff; color: #20242a; padding: 10px;"
         )
-        layout.addWidget(self.analysis_status_label)
-        layout.addStretch(1)
+        self.analysis_report_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        self.analysis_report_label.setMinimumWidth(300)
+        self.analysis_report_label.setMaximumWidth(430)
+        self.analysis_report_label.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Expanding,
+        )
+
+        result_layout.addWidget(plot_panel, 4)
+        result_layout.addWidget(self.analysis_report_label, 1)
+        layout.addWidget(result_panel, 1)
+
+        self.draw_processing_placeholder()
         return tab
+
+    def draw_processing_placeholder(self):
+        self.analysis_figure.clear()
+        signal_ax, dft_ax = self.analysis_figure.subplots(1, 2)
+
+        signal_ax.set_title("Signal (With mean removed)")
+        signal_ax.set_xlabel("Time [primary orbits]")
+        signal_ax.set_ylabel("Signal value")
+        signal_ax.set_facecolor("#fbfbfd")
+        signal_ax.grid(True, color="#d9dde5", linewidth=0.8)
+        signal_ax.set_xlim(0.0, 15.0)
+
+        dft_ax.set_title("DFT Analysis")
+        dft_ax.set_xlabel("Frequency [cycles / primary orbit]")
+        dft_ax.set_ylabel("DFT magnitude")
+        dft_ax.set_facecolor("#fbfbfd")
+        dft_ax.grid(True, color="#d9dde5", linewidth=0.8)
+        dft_ax.set_xlim(0.0, math.pi)
+        dft_ax.text(
+            0.5,
+            0.5,
+            "Select a CSV and run an analysis.",
+            transform=dft_ax.transAxes,
+            ha="center",
+            va="center",
+            color="#60656f",
+        )
+        self.analysis_canvas.draw_idle()
+
+    def draw_processing_plot(self, title, series, signal_series):
+        self.analysis_figure.clear()
+        signal_ax, dft_ax = self.analysis_figure.subplots(1, 2)
+
+        signal_ax.set_title("Signal (With mean removed)")
+        signal_ax.set_xlabel("Time [primary orbits]")
+        signal_ax.set_ylabel("Signal value")
+        signal_ax.set_facecolor("#fbfbfd")
+        signal_ax.grid(True, color="#d9dde5", linewidth=0.8)
+        signal_ax.set_xlim(0.0, 15.0)
+
+        for label, signal_time, signal_values, color in signal_series:
+            signal_ax.plot(
+                signal_time,
+                signal_values,
+                linewidth=1.0,
+                label=label,
+                color=color,
+            )
+
+        signal_ax.legend(loc="upper right", frameon=True, framealpha=0.92)
+
+        dft_ax.set_title(title)
+        dft_ax.set_xlabel("Frequency [cycles / primary orbit]")
+        dft_ax.set_ylabel("DFT magnitude")
+        dft_ax.set_facecolor("#fbfbfd")
+        dft_ax.grid(True, color="#d9dde5", linewidth=0.8)
+
+        for label, frequencies, magnitudes, color in series:
+            dft_ax.plot(
+                frequencies,
+                magnitudes,
+                linewidth=1.1,
+                label=label,
+                color=color,
+            )
+
+        dft_ax.set_xlim(0.0, math.pi)
+        dft_ax.legend(loc="upper right", frameon=True, framealpha=0.92)
+        self.analysis_canvas.draw_idle()
+
+    def format_characteristic_report(
+        self,
+        title,
+        file_path,
+        csv_timestep,
+        sample_line,
+        report_items,
+        extra_lines=None,
+    ):
+        lines = [
+            title,
+            "",
+            f"CSV: {file_path}",
+            f"timestep: {csv_timestep}",
+            sample_line,
+        ]
+
+        if extra_lines:
+            lines.extend(extra_lines)
+
+        for label, analysis in report_items:
+            lines.extend([
+                "",
+                label,
+                f"dominant frequency: {analysis['dominant_frequency']:.8g} cycles / primary orbit",
+                f"dominant period: {self.format_period(analysis['dominant_period'])} primary orbits",
+                f"dominant magnitude: {analysis['dominant_magnitude']:.8g}",
+                f"total power: {analysis['total_power']:.8g}",
+                f"top 3 concentration: {analysis['spectral_concentration_3']:.4f}",
+                "top peaks:",
+            ])
+
+            for rank, (frequency, magnitude, period) in enumerate(
+                zip(
+                    analysis["top_frequencies"],
+                    analysis["top_magnitudes"],
+                    analysis["top_periods"],
+                ),
+                start=1,
+            ):
+                lines.append(
+                    f"  {rank}. f={frequency:.8g}, "
+                    f"period={self.format_period(period)}, "
+                    f"magnitude={magnitude:.8g}"
+                )
+
+        return "\n".join(lines)
+
+    def format_period(self, period):
+        if math.isinf(period):
+            return "inf"
+        return f"{period:.8g}"
 
     def setup_plot(self):
         self.ax = self.figure.add_subplot(111)
@@ -535,16 +689,18 @@ class CR3BPGUI(QMainWindow):
         return line_edit
 
     def browse_analysis_csv(self):
+        csv_dir = os.path.abspath(CSV_OUTPUT_DIR)
+        os.makedirs(csv_dir, exist_ok=True)
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select simulation CSV",
-            os.getcwd(),
+            csv_dir,
             "CSV files (*.csv);;All files (*)",
         )
 
         if file_path:
             self.analysis_file_box.setText(file_path)
-            self.analysis_status_label.setText(f"Loaded path:\n{file_path}")
+            self.analysis_report_label.setText(f"Loaded path:\n{file_path}")
 
     def use_last_export_for_analysis(self):
         if not self.last_export_filename:
@@ -557,7 +713,7 @@ class CR3BPGUI(QMainWindow):
 
         file_path = os.path.abspath(self.last_export_filename)
         self.analysis_file_box.setText(file_path)
-        self.analysis_status_label.setText(f"Loaded last export:\n{file_path}")
+        self.analysis_report_label.setText(f"Loaded last export:\n{file_path}")
 
     def plot_position_dft(self, component):
         file_path = self.analysis_file_box.text().strip()
@@ -585,18 +741,28 @@ class CR3BPGUI(QMainWindow):
 
             if component == "x":
                 x_spectrum = position_spectrum(x_values, csv_timestep)
+                x_analysis = spectrum_characteristics(x_spectrum)
                 series = [
                     (
                         "x position",
                         x_spectrum["frequencies"],
                         x_spectrum["magnitudes"],
+                        "#1f77b4",
+                    ),
+                ]
+                signal_series = [
+                    (
+                        "x position (With mean removed)",
+                        x_spectrum["signal_time"],
+                        x_spectrum["signal"],
                         "#1f77b4",
                     ),
                 ]
                 title = "X Position DFT Magnitudes"
-                dominant_lines = [self.format_dominant_frequency("x", x_spectrum)]
+                report_items = [("x position", x_analysis)]
             elif component == "y":
                 y_spectrum = position_spectrum(y_values, csv_timestep)
+                y_analysis = spectrum_characteristics(y_spectrum)
                 series = [
                     (
                         "y position",
@@ -605,11 +771,21 @@ class CR3BPGUI(QMainWindow):
                         "#ff9f1c",
                     ),
                 ]
+                signal_series = [
+                    (
+                        "y position (With mean removed)",
+                        y_spectrum["signal_time"],
+                        y_spectrum["signal"],
+                        "#ff9f1c",
+                    ),
+                ]
                 title = "Y Position DFT Magnitudes"
-                dominant_lines = [self.format_dominant_frequency("y", y_spectrum)]
+                report_items = [("y position", y_analysis)]
             else:
                 x_spectrum = position_spectrum(x_values, csv_timestep)
                 y_spectrum = position_spectrum(y_values, csv_timestep)
+                x_analysis = spectrum_characteristics(x_spectrum)
+                y_analysis = spectrum_characteristics(y_spectrum)
                 series = [
                     (
                         "x position",
@@ -624,10 +800,24 @@ class CR3BPGUI(QMainWindow):
                         "#ff9f1c",
                     ),
                 ]
+                signal_series = [
+                    (
+                        "x position (With mean removed)",
+                        x_spectrum["signal_time"],
+                        x_spectrum["signal"],
+                        "#1f77b4",
+                    ),
+                    (
+                        "y position (With mean removed)",
+                        y_spectrum["signal_time"],
+                        y_spectrum["signal"],
+                        "#ff9f1c",
+                    ),
+                ]
                 title = "Position DFT Magnitudes"
-                dominant_lines = [
-                    self.format_dominant_frequency("x", x_spectrum),
-                    self.format_dominant_frequency("y", y_spectrum),
+                report_items = [
+                    ("x position", x_analysis),
+                    ("y position", y_analysis),
                 ]
         except (KeyError, ValueError, OSError) as exc:
             QMessageBox.critical(
@@ -637,35 +827,110 @@ class CR3BPGUI(QMainWindow):
             )
             return
 
-        window = DFTPlotWindow(title, series)
-        self.analysis_windows.append(window)
-        window.show()
-
-        self.analysis_status_label.setText(
-            f"CSV: {file_path}\n"
-            f"timestep: {csv_timestep}\n"
-            f"samples: x={len(x_values)}, y={len(y_values)}\n"
-            f"latest plot: {title}\n"
-            + "\n".join(dominant_lines)
+        self.draw_processing_plot(title, series, signal_series)
+        self.analysis_report_label.setText(
+            self.format_characteristic_report(
+                title,
+                file_path,
+                csv_timestep,
+                f"samples: x={len(x_values)}, y={len(y_values)}",
+                report_items,
+            )
         )
 
-    def format_dominant_frequency(self, label, spectrum):
-        dominant_frequency = spectrum["dominant_frequency"]
-        dominant_magnitude = spectrum["dominant_magnitude"]
+    def plot_point_distance_dft(self, point_key):
+        file_path = self.analysis_file_box.text().strip()
 
-        if dominant_frequency is None:
-            return f"{label} dominant nonzero frequency: N/A"
+        if not file_path:
+            QMessageBox.warning(
+                self,
+                "No CSV selected",
+                "Choose a generated simulation CSV first.",
+            )
+            return
 
-        print(
-            f"{label} dominant nonzero frequency: "
-            f"{dominant_frequency:.8g} cycles / simulation time unit"
+        if not os.path.exists(file_path):
+            QMessageBox.warning(
+                self,
+                "CSV not found",
+                f"Could not find:\n{file_path}",
+            )
+            return
+
+        try:
+            x_values, y_values, csv_timestep = load_position_csv(file_path)
+            _, csv_mu = load_csv_metadata(file_path)
+            if csv_mu is None:
+                raise ValueError("CSV does not contain a mu value.")
+            if not x_values or not y_values:
+                raise ValueError("CSV contains no x/y position rows.")
+
+            point_label, point_x, point_y, color = self.point_dft_target(
+                point_key,
+                csv_mu,
+            )
+            spectrum = point_distance_spectrum(
+                point_x,
+                point_y,
+                x_values,
+                y_values,
+                csv_timestep,
+            )
+            analysis = spectrum_characteristics(spectrum)
+            series = [
+                (
+                    f"distance to {point_label}",
+                    spectrum["frequencies"],
+                    spectrum["magnitudes"],
+                    color,
+                ),
+            ]
+            signal_series = [
+                (
+                    f"distance to {point_label} (With mean removed)",
+                    spectrum["signal_time"],
+                    spectrum["signal"],
+                    color,
+                ),
+            ]
+            title = f"Particle Distance to {point_label} DFT Magnitudes"
+            report_items = [(f"distance to {point_label}", analysis)]
+        except (KeyError, ValueError, OSError) as exc:
+            QMessageBox.critical(
+                self,
+                "DFT failed",
+                f"Could not compute point-distance DFT magnitudes from this CSV:\n{exc}",
+            )
+            return
+
+        self.draw_processing_plot(title, series, signal_series)
+        self.analysis_report_label.setText(
+            self.format_characteristic_report(
+                title,
+                file_path,
+                csv_timestep,
+                f"samples: {len(x_values)}",
+                report_items,
+                extra_lines=[
+                    f"mu: {csv_mu}",
+                    f"target: {point_label} ({point_x:.8g}, {point_y:.8g})",
+                ],
+            )
         )
 
-        return (
-            f"{label} dominant nonzero frequency: "
-            f"{dominant_frequency:.8g} cycles / simulation time unit "
-            f"(magnitude {dominant_magnitude:.8g})"
-        )
+    def point_dft_target(self, point_key, mu):
+        l4, l5 = lagrange_points(mu)
+        targets = {
+            "body1": ("Body 1", -mu, 0.0, "#1f77b4"),
+            "body2": ("Body 2", 1.0 - mu, 0.0, "#ff9f1c"),
+            "l4": ("L4", l4[0], l4[1], "#2a9d8f"),
+            "l5": ("L5", l5[0], l5[1], "#e76f51"),
+        }
+
+        if point_key not in targets:
+            raise ValueError(f"Unknown point target: {point_key}")
+
+        return targets[point_key]
 
     def parse_float(self, line_edit, fallback):
         try:
@@ -820,6 +1085,24 @@ class CR3BPGUI(QMainWindow):
         self.y_history = [self.state[1]]
         self.update_view()
 
+    def zoom_out_simulation_plot(self):
+        self.zoom_simulation_plot(1.5)
+
+    def zoom_in_simulation_plot(self):
+        self.zoom_simulation_plot(1 / 1.5)
+
+    def zoom_simulation_plot(self, zoom_factor):
+        x_min, x_max = self.ax.get_xlim()
+        y_min, y_max = self.ax.get_ylim()
+        x_center = (x_min + x_max) / 2
+        y_center = (y_min + y_max) / 2
+        x_half_width = (x_max - x_min) * zoom_factor / 2
+        y_half_width = (y_max - y_min) * zoom_factor / 2
+
+        self.ax.set_xlim(x_center - x_half_width, x_center + x_half_width)
+        self.ax.set_ylim(y_center - y_half_width, y_center + y_half_width)
+        self.canvas.draw_idle()
+
     def toggle_running(self):
         self.batch_mode = False
         self.batch_total_steps = 0
@@ -973,12 +1256,19 @@ class CR3BPGUI(QMainWindow):
         if not self.run_records:
             return
 
+<<<<<<< HEAD
+        os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
+=======
         export_folder = "simulations"
         os.makedirs(export_folder, exist_ok=True)
 
+>>>>>>> 878f7bdd96d71542b344964b1c1f5e7025e378d9
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_system_name = self.current_system_name.replace(" ", "_").replace("-", "_")
-        filename = f"cr3bp_{safe_system_name}_{timestamp}.csv"
+        filename = os.path.join(
+            CSV_OUTPUT_DIR,
+            f"cr3bp_{safe_system_name}_{timestamp}.csv",
+        )
 
         filepath = os.path.join(export_folder, filename)
 
