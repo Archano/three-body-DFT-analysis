@@ -4,10 +4,14 @@ import os
 import sys
 from datetime import datetime
 
+import numpy as np
+
 try:
     from PyQt6.QtCore import Qt, QTimer
     from PyQt6.QtWidgets import (
         QApplication,
+        QCheckBox,
+        QComboBox,
         QFileDialog,
         QFormLayout,
         QFrame,
@@ -40,8 +44,9 @@ from physicsEngine import (
     accelerationY,
     particleToBody1And2Distance,
     simSetup,
-    simulationStep,
+    simulationStep as euler_step,
 )
+from physicsEngineRK4 import simulationStep as rk4_step
 from DFTplotter import (
     load_csv_metadata,
     load_position_csv,
@@ -207,6 +212,7 @@ class CR3BPGUI(QMainWindow):
 
         tabs.addTab(simulation_tab, "Simulation")
         tabs.addTab(self.build_processing_tab(), "Processing")
+        tabs.addTab(self.build_frequency_report_tab(), "Frequency Report")
         self.setCentralWidget(tabs)
 
     def build_controls(self):
@@ -262,6 +268,15 @@ class CR3BPGUI(QMainWindow):
         sim_layout.addRow("dt per physics step", self.timestep_box)
         sim_layout.addRow("physics steps per redraw", self.steps_box)
         sim_layout.addRow("visible trail points", self.max_trail_box)
+
+        self.integrator_box = QComboBox()
+        self.integrator_box.addItems(["Euler", "RK4"])
+        self.integrator_box.setCurrentText("RK4")
+        self.integrator_box.setToolTip(
+            "Euler: fast, first-order (lower accuracy at large dt)\n"
+            "RK4: four-stage Runge-Kutta, fourth-order (recommended)"
+        )
+        sim_layout.addRow("Integrator", self.integrator_box)
 
         sim_buttons = QHBoxLayout()
         self.run_button = QPushButton("Run")
@@ -918,6 +933,428 @@ class CR3BPGUI(QMainWindow):
             )
         )
 
+    # Frequency tab
+
+    def build_frequency_report_tab(self):
+        tab = QWidget()
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        # --- File loader ---
+        file_group = QGroupBox("Load Simulation CSV")
+        file_layout = QVBoxLayout(file_group)
+        path_row = QHBoxLayout()
+        self.report_file_box = QLineEdit()
+        self.report_file_box.setPlaceholderText("Select a generated cr3bp_*.csv file")
+        browse_btn = QPushButton("Browse CSV")
+        browse_btn.clicked.connect(self.browse_report_csv)
+        last_btn = QPushButton("Use last export")
+        last_btn.clicked.connect(self.use_last_export_for_report)
+        path_row.addWidget(self.report_file_box, 1)
+        path_row.addWidget(browse_btn)
+        path_row.addWidget(last_btn)
+        file_layout.addLayout(path_row)
+        layout.addWidget(file_group)
+
+        # Signal sel
+        signals_group = QGroupBox("Signals to Include in Period Estimate")
+        signals_layout = QGridLayout(signals_group)
+
+        self.cb_x_pos = QCheckBox("X position DFT")
+        self.cb_x_pos.setChecked(True)
+        self.cb_y_pos = QCheckBox("Y position DFT")
+        self.cb_y_pos.setChecked(True)
+        self.cb_body1_dist = QCheckBox("Body 1 distance DFT")
+        self.cb_body1_dist.setChecked(True)
+        self.cb_body2_dist = QCheckBox("Body 2 distance DFT")
+        self.cb_body2_dist.setChecked(True)
+        self.cb_l4_dist = QCheckBox("L4 distance DFT")
+        self.cb_l4_dist.setChecked(True)
+        self.cb_l5_dist = QCheckBox("L5 distance DFT")
+        self.cb_l5_dist.setChecked(False)
+
+        signals_layout.addWidget(self.cb_x_pos,       0, 0)
+        signals_layout.addWidget(self.cb_y_pos,       0, 1)
+        signals_layout.addWidget(self.cb_body1_dist,  1, 0)
+        signals_layout.addWidget(self.cb_body2_dist,  1, 1)
+        signals_layout.addWidget(self.cb_l4_dist,     2, 0)
+        signals_layout.addWidget(self.cb_l5_dist,     2, 1)
+
+        tip = QLabel(
+            "Tip: enable L4 if your particle librates near L4, L5 if near L5. "
+            "Including both when only one is relevant will reduce confidence."
+        )
+        tip.setWordWrap(True)
+        tip.setStyleSheet("color: #555; font-size: 11px; padding-top: 4px;")
+        signals_layout.addWidget(tip, 3, 0, 1, 2)
+
+        run_btn = QPushButton("Run All DFTs & Generate Frequency Report")
+        run_btn.setStyleSheet("font-weight: bold; padding: 6px;")
+        run_btn.clicked.connect(self.run_all_dfts_report)
+        signals_layout.addWidget(run_btn, 4, 0, 1, 2)
+        layout.addWidget(signals_group)
+
+        # Results
+        result_panel = QWidget()
+        result_layout = QHBoxLayout(result_panel)
+        result_layout.setContentsMargins(0, 0, 0, 0)
+        result_layout.setSpacing(12)
+
+        plot_panel = QWidget()
+        plot_layout = QVBoxLayout(plot_panel)
+        plot_layout.setContentsMargins(0, 0, 0, 0)
+
+        self.report_figure = Figure(figsize=(8, 4), tight_layout=True, facecolor="#f7f8fa")
+        self.report_canvas = FigureCanvas(self.report_figure)
+        self.report_canvas.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Expanding,
+        )
+        self.report_toolbar = NavigationToolbar(self.report_canvas, self)
+        plot_layout.addWidget(self.report_toolbar)
+        plot_layout.addWidget(self.report_canvas)
+
+        self.freq_report_label = QLabel(
+            "No frequency report generated yet.\n\n"
+            "Select a CSV, choose which signals to include,\n"
+            "then click 'Run All DFTs & Generate Frequency Report'."
+        )
+        self.freq_report_label.setWordWrap(True)
+        self.freq_report_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self.freq_report_label.setFrameShape(QFrame.Shape.StyledPanel)
+        self.freq_report_label.setStyleSheet(
+            "font-family: Consolas, monospace; font-size: 11px; "
+            "background: #ffffff; color: #20242a; padding: 10px;"
+        )
+        self.freq_report_label.setAlignment(
+            Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignTop
+        )
+        self.freq_report_label.setMinimumWidth(320)
+        self.freq_report_label.setMaximumWidth(460)
+        self.freq_report_label.setSizePolicy(
+            QSizePolicy.Policy.Fixed,
+            QSizePolicy.Policy.Expanding,
+        )
+
+        result_layout.addWidget(plot_panel, 4)
+        result_layout.addWidget(self.freq_report_label, 1)
+        layout.addWidget(result_panel, 1)
+
+        self._draw_report_placeholder()
+        return tab
+
+    def browse_report_csv(self):
+        csv_dir = os.path.abspath(CSV_OUTPUT_DIR)
+        os.makedirs(csv_dir, exist_ok=True)
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select simulation CSV",
+            csv_dir,
+            "CSV files (*.csv);;All files (*)",
+        )
+        if file_path:
+            self.report_file_box.setText(file_path)
+
+    def use_last_export_for_report(self):
+        if not self.last_export_filename:
+            QMessageBox.warning(
+                self,
+                "No export yet",
+                "No CSV has been exported in this session yet.",
+            )
+            return
+        self.report_file_box.setText(os.path.abspath(self.last_export_filename))
+
+    def _draw_report_placeholder(self):
+        self.report_figure.clear()
+        ax1, ax2 = self.report_figure.subplots(1, 2)
+        for ax, title in [
+            (ax1, "Estimated Period by Signal"),
+            (ax2, "Period Deviation from Mean"),
+        ]:
+            ax.set_facecolor("#fbfbfd")
+            ax.set_title(title)
+            ax.grid(True, axis="y", color="#d9dde5", linewidth=0.8)
+            ax.text(
+                0.5, 0.5,
+                "Run All DFTs to see results.",
+                transform=ax.transAxes,
+                ha="center", va="center", color="#60656f",
+            )
+        self.report_canvas.draw_idle()
+
+    def run_all_dfts_report(self):
+        file_path = self.report_file_box.text().strip()
+
+        if not file_path:
+            QMessageBox.warning(
+                self, "No CSV selected",
+                "Choose a generated simulation CSV first.",
+            )
+            return
+
+        if not os.path.exists(file_path):
+            QMessageBox.warning(
+                self, "CSV not found",
+                f"Could not find:\n{file_path}",
+            )
+            return
+
+        try:
+            x_values, y_values, csv_timestep = load_position_csv(file_path)
+            _, csv_mu = load_csv_metadata(file_path)
+            if csv_mu is None:
+                raise ValueError("CSV does not contain a mu value.")
+            if not x_values or not y_values:
+                raise ValueError("CSV contains no x/y position rows.")
+        except (KeyError, ValueError, OSError) as exc:
+            QMessageBox.critical(
+                self, "Load failed",
+                f"Could not load CSV:\n{exc}",
+            )
+            return
+
+        _, _, _, l4, l5 = lagrange_points(csv_mu)
+
+        results = []
+
+        def _add(label, spectrum, color):
+            dom_freq = spectrum["dominant_frequency"]
+            dom_mag  = spectrum["dominant_magnitude"]
+            if dom_freq is not None and dom_freq > 0:
+                period = 1.0 / dom_freq
+            else:
+                period = float("inf")
+            results.append({
+                "label":     label,
+                "frequency": dom_freq,
+                "period":    period,
+                "magnitude": dom_mag,
+                "color":     color,
+            })
+
+        try:
+            if self.cb_x_pos.isChecked():
+                _add("X position",
+                     position_spectrum(x_values, csv_timestep),
+                     "#1f77b4")
+            if self.cb_y_pos.isChecked():
+                _add("Y position",
+                     position_spectrum(y_values, csv_timestep),
+                     "#ff9f1c")
+            if self.cb_body1_dist.isChecked():
+                _add("Dist. Body 1",
+                     point_distance_spectrum(
+                         -csv_mu, 0.0, x_values, y_values, csv_timestep),
+                     "#9b5de5")
+            if self.cb_body2_dist.isChecked():
+                _add("Dist. Body 2",
+                     point_distance_spectrum(
+                         1.0 - csv_mu, 0.0, x_values, y_values, csv_timestep),
+                     "#f15bb5")
+            if self.cb_l4_dist.isChecked():
+                _add("Dist. L4",
+                     point_distance_spectrum(
+                         l4[0], l4[1], x_values, y_values, csv_timestep),
+                     "#2a9d8f")
+            if self.cb_l5_dist.isChecked():
+                _add("Dist. L5",
+                     point_distance_spectrum(
+                         l5[0], l5[1], x_values, y_values, csv_timestep),
+                     "#e76f51")
+        except (ValueError, OSError) as exc:
+            QMessageBox.critical(
+                self, "DFT failed",
+                f"Could not compute DFT magnitudes:\n{exc}",
+            )
+            return
+
+        if not results:
+            QMessageBox.warning(
+                self, "No signals selected",
+                "Enable at least one signal checkbox above.",
+            )
+            return
+
+        #Statistics on signals
+        valid = [r for r in results if not math.isinf(r["period"])]
+        if not valid:
+            QMessageBox.warning(
+                self, "No valid periods",
+                "All selected signals produced zero or infinite periods.\n"
+                "Try a longer simulation run or a different initial condition.",
+            )
+            return
+
+        periods     = np.array([r["period"] for r in valid])
+        mean_period = float(np.mean(periods))
+        std_period  = float(np.std(periods))      # population std
+        spread      = float(np.ptp(periods))       # max - min
+        cv          = (std_period / mean_period * 100.0) if mean_period > 0 else float("inf")
+
+        if cv < 2.0:
+            confidence_label, confidence_color = "EXCELLENT", "#2a9d8f"
+        elif cv < 5.0:
+            confidence_label, confidence_color = "GOOD",      "#57cc99"
+        elif cv < 10.0:
+            confidence_label, confidence_color = "FAIR",      "#f4a261"
+        else:
+            confidence_label, confidence_color = "POOR",      "#e63946"
+
+        for r in results:
+            if not math.isinf(r["period"]):
+                r["deviation"] = r["period"] - mean_period
+                r["dev_pct"]   = (r["period"] - mean_period) / mean_period * 100.0
+            else:
+                r["deviation"] = float("inf")
+                r["dev_pct"]   = float("inf")
+
+        mean_real_days = (
+            mean_period * self.primary_period_days
+            if self.primary_period_days > 0
+            else None
+        )
+
+        stats = {
+            "mean_period":      mean_period,
+            "std_period":       std_period,
+            "cv":               cv,
+            "spread":           spread,
+            "confidence_label": confidence_label,
+            "confidence_color": confidence_color,
+            "n_valid":          len(valid),
+            "n_total":          len(results),
+            "csv_mu":           csv_mu,
+            "csv_timestep":     csv_timestep,
+            "n_samples":        len(x_values),
+            "mean_real_days":   mean_real_days,
+        }
+
+        self.draw_frequency_report_plot(results, stats)
+        self.freq_report_label.setText(
+            self._format_frequency_report(results, stats, file_path)
+        )
+
+    def draw_frequency_report_plot(self, results, stats):
+        self.report_figure.clear()
+        period_ax, dev_ax = self.report_figure.subplots(1, 2)
+
+        labels   = [r["label"] for r in results]
+        periods  = [
+            r["period"] if not math.isinf(r["period"]) else 0.0
+            for r in results
+        ]
+        dev_pcts = [
+            r.get("dev_pct", 0.0)
+            if not math.isinf(r.get("dev_pct", float("inf"))) else 0.0
+            for r in results
+        ]
+        colors  = [r["color"] for r in results]
+        x_pos   = np.arange(len(results))
+
+        # Left panel: period per signal + mean line
+        period_ax.bar(x_pos, periods, color=colors,
+                      edgecolor="#444444", linewidth=0.8, alpha=0.85)
+        period_ax.axhline(
+            stats["mean_period"],
+            color="#d62828", linewidth=1.8, linestyle="--",
+            label=f"Mean = {stats['mean_period']:.6g}",
+        )
+        period_ax.set_xticks(x_pos)
+        period_ax.set_xticklabels(labels, rotation=28, ha="right", fontsize=9)
+        period_ax.set_ylabel("Period [primary orbits]")
+        period_ax.set_title("Estimated Period by Signal")
+        period_ax.set_facecolor("#fbfbfd")
+        period_ax.grid(True, axis="y", color="#d9dde5", linewidth=0.8)
+        period_ax.legend(fontsize=9, frameon=True, framealpha=0.9)
+
+        # Right panel - deviation from mean, coloured by sign
+        dev_bar_colors = [
+            "#2a9d8f" if d >= 0 else "#e76f51"
+            for d in dev_pcts
+        ]
+        dev_ax.bar(x_pos, dev_pcts, color=dev_bar_colors,
+                   edgecolor="#444444", linewidth=0.8, alpha=0.85)
+        dev_ax.axhline(0.0, color="#333333", linewidth=1.0)
+        dev_ax.set_xticks(x_pos)
+        dev_ax.set_xticklabels(labels, rotation=28, ha="right", fontsize=9)
+        dev_ax.set_ylabel("Deviation from consensus mean [%]")
+        dev_ax.set_title(
+            f"Period Deviation from Mean\n"
+            f"Confidence: {stats['confidence_label']}  "
+            f"(CV = {stats['cv']:.2f}%)"
+        )
+        dev_ax.set_facecolor("#fbfbfd")
+        dev_ax.grid(True, axis="y", color="#d9dde5", linewidth=0.8)
+
+        self.report_canvas.draw_idle()
+
+    def _format_frequency_report(self, results, stats, file_path):
+        lines = [
+            "FREQUENCY REPORT",
+            "",
+            f"CSV:      {os.path.basename(file_path)}",
+            f"mu:       {stats['csv_mu']:.8g}",
+            f"timestep: {stats['csv_timestep']}",
+            f"samples:  {stats['n_samples']}",
+            f"signals:  {stats['n_valid']} valid / "
+            f"{stats['n_total']} selected",
+            "",
+            "Per-Signal Results",
+        ]
+
+        for r in results:
+            freq_str = (
+                f"{r['frequency']:.8g}"
+                if r["frequency"] is not None
+                else "N/A"
+            )
+            period_str = self.format_period(r["period"])
+            if not math.isinf(r.get("dev_pct", float("inf"))):
+                dev_str = f"{r['dev_pct']:+.3f}%"
+            else:
+                dev_str = "excluded (infinite period)"
+            lines += [
+                "",
+                f"[{r['label']}]",
+                f"  freq:   {freq_str} cyc/orbit",
+                f"  period: {period_str} orbits",
+                f"  dev:    {dev_str}",
+            ]
+
+        lines += [
+            "",
+            "Consensus Estimate",
+            f"mean period:  {stats['mean_period']:.8g} primary orbits",
+            f"std dev:      {stats['std_period']:.8g} orbits",
+            f"spread:       {stats['spread']:.8g} orbits",
+            f"coeff. var.:  {stats['cv']:.4f}%",
+        ]
+
+        if stats.get("mean_real_days") is not None:
+            lines.append(
+                f"real time:    {stats['mean_real_days']:.4f} days"
+                f"  ({self.primary_period_days:.4f} d/orbit)"
+            )
+
+        lines += [
+            "",
+            f"Confidence:   {stats['confidence_label']}",
+            "  <2%  = Excellent",
+            "  <5%  = Good",
+            "  <10% = Fair",
+            "  >=10% = Poor",
+        ]
+
+        return "\n".join(lines)
+
+
+    # End Frequency tab
+
+
     def point_dft_target(self, point_key, mu):
         _, _, _, l4, l5 = lagrange_points(mu)
         targets = {
@@ -1153,8 +1590,14 @@ class CR3BPGUI(QMainWindow):
         if self.batch_mode:
             steps_this_update = min(steps_this_update, self.remaining_batch_steps)
 
+        step_fn = (
+            rk4_step
+            if self.integrator_box.currentText() == "RK4"
+            else euler_step
+        )
+
         for _ in range(steps_this_update):
-            self.state, acc_x, acc_y, r1, r2 = simulationStep(
+            self.state, acc_x, acc_y, r1, r2 = step_fn(
                 self.state,
                 self.timestep,
                 self.mu,
@@ -1212,6 +1655,7 @@ class CR3BPGUI(QMainWindow):
         export_line = self.last_export_filename or "none"
         self.status_label.setText(
             f"System: {self.current_system_name}   "
+            f"Integrator: {self.integrator_box.currentText()}   "
             f"Running: {self.running}   "
             f"mu: {self.mu:.8f}   "
             f"t_sim: {self.time:.4f}   "
