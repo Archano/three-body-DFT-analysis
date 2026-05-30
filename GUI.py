@@ -919,7 +919,7 @@ class CR3BPGUI(QMainWindow):
         )
 
     def point_dft_target(self, point_key, mu):
-        l4, l5 = lagrange_points(mu)
+        _, _, _, l4, l5 = lagrange_points(mu)
         targets = {
             "body1": ("Body 1", -mu, 0.0, "#1f77b4"),
             "body2": ("Body 2", 1.0 - mu, 0.0, "#ff9f1c"),
@@ -1256,21 +1256,13 @@ class CR3BPGUI(QMainWindow):
         if not self.run_records:
             return
 
-<<<<<<< HEAD
         os.makedirs(CSV_OUTPUT_DIR, exist_ok=True)
-=======
-        export_folder = "simulations"
-        os.makedirs(export_folder, exist_ok=True)
-
->>>>>>> 878f7bdd96d71542b344964b1c1f5e7025e378d9
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_system_name = self.current_system_name.replace(" ", "_").replace("-", "_")
         filename = os.path.join(
             CSV_OUTPUT_DIR,
             f"cr3bp_{safe_system_name}_{timestamp}.csv",
         )
-
-        filepath = os.path.join(export_folder, filename)
 
         fieldnames = [
             "step_index",
@@ -1289,12 +1281,12 @@ class CR3BPGUI(QMainWindow):
             "r2",
         ]
 
-        with open(filepath, "w", newline="") as file:
+        with open(filename, "w", newline="") as file:
             writer = csv.DictWriter(file, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(self.run_records)
 
-        self.last_export_filename = filepath
+        self.last_export_filename = filename
 
 
 def main():
